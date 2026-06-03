@@ -4,3 +4,5 @@ openai
 pandas
 openpyxl
 python-dotenv
+PyMuPDF
+Pillow
