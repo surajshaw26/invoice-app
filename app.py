@@ -51,10 +51,38 @@ OPENAI_KEY = os.getenv("OPENAI_KEY")
 # App Layout Configuration
 st.set_page_config(layout="wide", page_title="Intelligent Document Extraction & Validation Portal")
 
-# Custom CSS for Premium Dashboard Look
+# Custom CSS -- HighRadius-style theme (typography + brand accents).
+# Colours below mirror .streamlit/config.toml: config.toml themes the WIDGETS
+# (buttons, sidebar, progress bar); this block themes TEXT + headings.
+# To restyle, change the hexes in BOTH files. The font loads from Google Fonts
+# (needs internet; falls back to the system sans-serif if offline).
 st.markdown("""
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+    /* Brand font on text elements only -- NOT on bare <span>/<i>, so Streamlit's
+       material icons (expander arrows, spinner, etc.) keep rendering. */
+    .stApp, .stMarkdown, p, li, td, th,
+    h1, h2, h3, h4, h5, h6, label,
+    .stButton button, .stDownloadButton button,
+    [data-testid="stMetricValue"], [data-testid="stMetricLabel"],
+    input, textarea, select {
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+    }
+
     .block-container { padding-top: 1.5rem; padding-bottom: 1rem; }
+
+    /* Headings in HighRadius deep navy */
+    h1, h2, h3 { color: #0B1F4D !important; font-weight: 700 !important; letter-spacing: -0.01em; }
+
+    /* Crisp navy metric numbers for the dashboard feel */
+    [data-testid="stMetricValue"] { color: #0B1F4D !important; font-weight: 700 !important; }
+
+    /* Buttons: rounded + bold (fill colour comes from config primaryColor) */
+    .stButton button, .stDownloadButton button { border-radius: 8px; font-weight: 600; }
+
+    /* Brand-tinted divider */
+    hr { border-top: 1px solid #E2E8F2; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -65,46 +93,44 @@ st.markdown("---")
 # =====================================================================
 # COLUMN SCHEMA CONFIG  --  edit these lists to change your columns
 # =====================================================================
-# Master "Invoices" sheet: fixed, ordered columns.
-# Left  = Azure field name  (do NOT change -- must match Azure exactly)
-# Right = the column label you want to see in Excel.
+# Master "Invoices" (HEADER) sheet: fixed, ordered columns.
+# Left  = Azure field name; Right = the column label you want in Excel.
+# Most lefts are real Azure prebuilt-invoice fields. A few are NOT Azure fields
+# and are filled by the app instead (so the column still exists and is ordered):
+#   - "Currency" and "Freight" are DERIVED in the processing loop (see below).
+#   - "VendorId" / "PaymentMethod" are downstream LOOKUPS (Azure has no such field),
+#     so they extract blank and your application fills them later.
+# Any Azure field NOT listed here is auto-appended as an incremental column
+# (header tab only), ordered by frequency, capped at MAX_TOTAL_COLUMNS.
 TARGET_SCHEMA = [
-    # --- Parties ---
-    ("VendorName",        "Vendor"),
-    ("VendorEmail",       "Vendor Email"),
-    ("CustomerName",      "Customer"),
-    ("CustomerId",        "Customer ID"),
-    # --- Invoice identity & dates ---
-    ("InvoiceId",         "Invoice Number"),
-    ("PurchaseOrder",     "PO Number"),
-    ("InvoiceDate",       "Invoice Date"),
-    ("DueDate",           "Due Date"),
-    ("PaymentTerm",       "Payment Terms"),
-    # --- Money ---
-    ("SubTotal",          "Subtotal"),
-    ("TotalTax",          "Tax"),
-    ("TaxDetails",        "Tax Details"),
-    ("InvoiceTotal",      "Invoice Total"),
-    ("AmountDue",         "Amount Due"),
-    ("PaymentDetails",    "Payment Details"),
-    # --- Addresses (mandatory) ---
-    ("VendorAddress",     "Vendor Address"),
-    ("BillingAddress",    "Billing Address"),
-    ("CustomerAddress",   "Customer Address"),
-    ("ShippingAddress",   "Shipping Address"),
-    ("RemittanceAddress", "Remittance Address"),
+    ("InvoiceId",        "Invoice Number"),
+    ("InvoiceDate",      "Invoice Date"),
+    ("Currency",         "Currency"),                     # DERIVED from money fields' currency code
+    ("AmountDue",        "Amount"),                       # Azure "AmountDue" (change to InvoiceTotal if you meant gross)
+    ("PaymentTerm",      "Payment Terms"),
+    ("DueDate",          "Due Date"),
+    ("CustomerName",     "Bill To"),                      # the billed party (Azure customer)
+    ("CustomerId",       "Bill To ID (Subsidiary ID)"),   # Azure customer id if present (else downstream lookup)
+    ("VendorName",       "Vendor"),
+    ("VendorId",         "Vendor ID"),                    # LOOKUP downstream (no Azure field) -> blank
+    ("PaymentMethod",    "Payment Method"),               # LOOKUP downstream (no Azure field) -> blank
+    ("PurchaseOrder",    "PO Number"),
+    ("ShippingAddress",  "Ship to address"),
+    ("SubTotal",         "SubTotal"),
+    ("Freight",          "Freight"),                      # DERIVED: sum of freight line amounts
+    ("Surcharge",        "Surcharge"),                    # DERIVED: sum of surcharge/fuel line amounts
+    ("TotalTax",         "Taxes"),
+    ("InvoiceTotal",     "Invoice Total"),
 ]
 
-# Second "Line Items" sheet: columns pulled from each line of the invoice.
+# Second "Line Items" (LINE) sheet: simple fixed columns, no incremental/parking.
 # Left = Azure line-item sub-field, Right = your column label.
 LINE_ITEM_FIELDS = [
+    ("ProductCode", "Item Number"),
     ("Description", "Description"),
+    ("UnitPrice",   "Price"),
     ("Quantity",    "Quantity"),
-    ("Unit",        "Unit"),
-    ("UnitPrice",   "Unit Price"),
     ("Amount",      "Amount"),
-    ("ProductCode", "Product Code"),
-    ("Tax",         "Tax"),
 ]
 
 # Fixed metadata/audit columns pinned at the front of the master sheet.
@@ -153,28 +179,29 @@ MAX_FILES = 50                             # hard cap on files processed per bat
 MONEY_NUMBER_FORMAT = "#,##0.00"    # e.g. "$#,##0.00" for a $ sign, "€#,##0.00", "£#,##0.00"
 DATE_NUMBER_FORMAT  = "yyyy-mm-dd"  # e.g. "mm/dd/yyyy" or "dd/mm/yyyy"
 
-# Master "Invoices" sheet (keys = the column LABELS from TARGET_SCHEMA).
+# Master "Invoices" (HEADER) sheet (keys = column LABELS from TARGET_SCHEMA).
 INVOICE_COLUMN_TYPES = {
-    "Customer ID":   "text",
-    "Invoice Number":"text",
-    "PO Number":     "text",
-    "Subtotal":      "money",
-    "Tax":           "money",
-    "Invoice Total": "money",
-    "Amount Due":    "money",
-    "Invoice Date":  "date",
-    "Due Date":      "date",
+    "Invoice Number":             "text",   # identifiers -> text (keep leading zeros)
+    "PO Number":                  "text",
+    "Bill To ID (Subsidiary ID)": "text",
+    "Vendor ID":                  "text",
+    "Invoice Date":               "date",
+    "Due Date":                   "date",
+    "Amount":                     "money",
+    "SubTotal":                   "money",
+    "Freight":                    "money",
+    "Surcharge":                  "money",
+    "Taxes":                      "money",
+    "Invoice Total":              "money",
 }
 
-# "Line Items" sheet (keys = the column labels on that tab).
-# NOTE: per-line "Tax" is intentionally left as text -- it can be an amount
-# ("$2.40") OR a rate ("8%"), and forcing it numeric would mangle the rate.
+# "Line Items" (LINE) sheet (keys = the column labels on that tab).
 LINE_ITEM_COLUMN_TYPES = {
     "Source File":    "text",
     "Invoice Number": "text",
-    "Product Code":   "text",
+    "Item Number":    "text",   # keep leading zeros / avoid scientific notation
+    "Price":          "money",
     "Quantity":       "number",
-    "Unit Price":     "money",
     "Amount":         "money",
 }
 
@@ -346,12 +373,11 @@ def extract_line_items(items_field):
     """Turn Azure's 'Items' array field into a list of flat row dicts, one per
     line item.
 
-    FREIGHT SAFEGUARD: only rows that carry a Quantity or a Unit Price are kept.
-    Freight invoices (FedEx etc.) have no products, so Azure fills 'Items' with
-    charge lines (Fuel Surcharge, Discount, ...) that have neither -- those are
-    dropped so they never pollute the product line-item tab. NOTE: a side effect
-    is that flat lines without a quantity/unit price (e.g. a single service fee)
-    are also excluded. Loosen the condition below if you want to keep those."""
+    FREIGHT SAFEGUARD (product-only): keep a row only if it has a Quantity OR a
+    Price -- i.e. real product lines. Flat charge lines like Freight / Fuel
+    Surcharge (which carry an Amount but no quantity/price) are DROPPED here;
+    they are captured instead as the header 'Freight' / 'Surcharge' totals.
+    (Accepted trade-off: flat service lines with no qty/price are also excluded.)"""
     rows = []
     if items_field is None:
         return rows
@@ -361,13 +387,54 @@ def extract_line_items(items_field):
         row = {}
         for az, friendly in LINE_ITEM_FIELDS:
             row[friendly] = clean_field_value(obj.get(az))
-        if str(row.get("Quantity", "")).strip() or str(row.get("Unit Price", "")).strip():
+        if (str(row.get("Quantity", "")).strip()
+                or str(row.get("Price", "")).strip()):
             rows.append(row)
     # Number the kept rows sequentially
     out = []
     for n, r in enumerate(rows, start=1):
         out.append({"Line #": n, **r})
     return out
+
+
+# Words that mark a line as freight vs surcharge (used to derive the header
+# Freight / Surcharge totals). Surcharge is checked first so "fuel surcharge"
+# counts as surcharge, not freight. Edit these to tune what counts as each.
+FREIGHT_KEYWORDS   = ("freight", "shipping", "delivery", "cartage", "carriage", "handling")
+SURCHARGE_KEYWORDS = ("surcharge", "fuel")
+
+
+def _charge_class(description):
+    """Classify a line by its description: 'surcharge', 'freight', or None."""
+    d = (description or "").lower()
+    if any(k in d for k in SURCHARGE_KEYWORDS):
+        return "surcharge"
+    if any(k in d for k in FREIGHT_KEYWORDS):
+        return "freight"
+    return None
+
+
+def _sum_charges(items_field):
+    """Scan the RAW Azure 'Items' array and total freight vs surcharge charge-lines
+    by description. Returns (freight_str, surcharge_str) as plain numeric strings
+    (e.g. '125.00'), each '' if none found. Runs on the raw array because the
+    line-item list is product-only, so these charge-lines were dropped from it."""
+    freight, surcharge = 0.0, 0.0
+    f_found = s_found = False
+    array = getattr(items_field, "value_array", None) or []
+    for item in array:
+        obj = getattr(item, "value_object", None) or {}
+        cls = _charge_class(clean_field_value(obj.get("Description")))
+        if cls is None:
+            continue
+        amt = _parse_money(clean_field_value(obj.get("Amount")))
+        if amt is None:
+            continue
+        if cls == "surcharge":
+            surcharge += amt; s_found = True
+        else:
+            freight += amt; f_found = True
+    return (f"{freight:.2f}" if f_found else ""), (f"{surcharge:.2f}" if s_found else "")
 
 
 # ---------------------------------------------------------------------
@@ -653,6 +720,7 @@ with st.sidebar:
                             # ---- PHASE 1: take Azure's reading for every field ----
                             document_fields = {}
                             low_conf = []
+                            currency_code = None   # captured for the derived "Currency" column
                             for field_name, field_data in doc_fields.items():
                                 val = clean_field_value(field_data)            # FIX #3: clean text
                                 conf = getattr(field_data, "confidence", None)  # FIX #4: real score / None
@@ -666,8 +734,30 @@ with st.sidebar:
                                 }
                                 if conf is not None and conf < CONFIDENCE_THRESHOLD and field_name != "Items":
                                     low_conf.append(field_name)
+                                # Currency isn't a standalone Azure field -- it's the
+                                # currency code attached to money fields (InvoiceTotal, etc.)
+                                if currency_code is None:
+                                    _vc = getattr(field_data, "value_currency", None)
+                                    _cc = getattr(_vc, "currency_code", None) if _vc is not None else None
+                                    if _cc:
+                                        currency_code = str(_cc)
 
                             line_items = extract_line_items(doc_fields.get("Items"))
+
+                            # ---- DERIVED header fields (no direct Azure field) ----
+                            if currency_code:
+                                document_fields["Currency"] = {"value": currency_code,
+                                    "confidence": None, "source": "Derived", "regions": []}
+                            # Freight & Surcharge: detect charge-lines in the RAW Items
+                            # array and total them (the line-item list is product-only,
+                            # so those charge-lines were dropped from it).
+                            freight_total, surcharge_total = _sum_charges(doc_fields.get("Items"))
+                            if freight_total:
+                                document_fields["Freight"] = {"value": freight_total,
+                                    "confidence": None, "source": "Derived", "regions": []}
+                            if surcharge_total:
+                                document_fields["Surcharge"] = {"value": surcharge_total,
+                                    "confidence": None, "source": "Derived", "regions": []}
 
                             # ---- PHASE 2 (#6): ONE multimodal call per invoice, isolated (#7) ----
                             # If the LLM step fails we KEEP every Azure value and skip the
@@ -695,6 +785,15 @@ with st.sidebar:
                                 except Exception as llm_err:
                                     logger.warning("LLM fallback skipped for %s; Azure values kept. (%s)",
                                                    file.name, llm_err)
+
+                            # "Amount" = AmountDue; fall back to Invoice Total when the
+                            # invoice doesn't separately state an amount due (#4 default).
+                            _ad = document_fields.get("AmountDue", {}).get("value", "")
+                            if not str(_ad).strip():
+                                _it = document_fields.get("InvoiceTotal", {}).get("value", "")
+                                if str(_it).strip():
+                                    document_fields["AmountDue"] = {"value": _it,
+                                        "confidence": None, "source": "Derived", "regions": []}
 
                             invoice_parts.append({
                                 "fields": document_fields,
@@ -982,6 +1081,8 @@ if s_state.batch_results:
                     # Confidence shown honestly (mirrors the overlay box colours from #4):
                     if f_meta["source"] == "LLM Fallback":
                         conf_text = "🔄 LLM — no score"      # LLM gives no calibrated number
+                    elif f_meta["source"] == "Derived":
+                        conf_text = "🧮 derived"             # computed by the app (Currency, Freight)
                     elif conf is None:
                         conf_text = "⚪ N/A"                  # Azure attached no score
                     elif conf >= CONFIDENCE_THRESHOLD:
